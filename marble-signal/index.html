@@ -1,0 +1,1088 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dither Text: Newsprint Type</title>
+<style>
+html,body{margin:0;height:100%;background:transparent}
+.dither-text-frame{height:100dvh}
+.dither-text-frame{width:100%;height:100%;min-height:0;overflow:hidden}.dither-text-canvas{display:block;width:100%;height:100%}
+body{display:grid;place-items:center}.dither-text-frame{width:min(100vw,calc(100dvh * 1.7777777777777777));height:min(100dvh,calc(100vw * 0.5625))}
+</style>
+</head>
+<body>
+<div class="dither-text-frame"><canvas class="dither-text-canvas" role="img" aria-label="Dither rendering of the source media"></canvas></div>
+<script type="module">
+/**
+ * Where a source image lands inside a target box.
+ *
+ * Twelve texture engines each carried their own copy of the same
+ * `Math.min(w / sw, h / sh)` plus centred offsets. This is that formula, once,
+ * with the other half of the choice available: `contain` fits the whole source
+ * and leaves margins, `cover` fills the box and crops the overflow.
+ *
+ * The return value is both halves of a nine-argument `drawImage`. `source` is
+ * the region to read out of the image and `dest` is where it goes in the box,
+ * so contain reads the whole image into a smaller centred rect and cover reads
+ * a centred crop into the whole box. Engines that sample into a scratch grid
+ * scale `dest` into grid space and pass `source` through untouched.
+ */
+/**
+ * The fit a texture should use. Previews and exports share it, so what the
+ * catalogue shows is what the file contains.
+ *
+ * `cover` is the default because a texture is bought for the effect, not for
+ * the demo photograph's composition, and a catalogue only reads as a grid when
+ * every tile is the same size. A look that needs its whole frame can opt back
+ * out with `sourceFit: 'contain'` in its config.
+ */
+function sourceFit(config) {
+  return config?.sourceFit === 'contain' ? 'contain' : 'cover';
+}
+
+function frameSource(width, height, sourceWidth, sourceHeight, mode = 'contain') {
+  const w = Math.max(1, Number(width) || 1);
+  const h = Math.max(1, Number(height) || 1);
+  const sw = Math.max(1, Number(sourceWidth) || 1);
+  const sh = Math.max(1, Number(sourceHeight) || 1);
+
+  if (mode === 'cover') {
+    const scale = Math.max(w / sw, h / sh);
+    // Clamped because a rounding error that asks for more pixels than the image
+    // has makes drawImage sample the transparent edge instead of the picture.
+    const cropW = Math.min(sw, w / scale);
+    const cropH = Math.min(sh, h / scale);
+    return {
+      source: { x: (sw - cropW) / 2, y: (sh - cropH) / 2, width: cropW, height: cropH },
+      dest: { x: 0, y: 0, width: w, height: h }
+    };
+  }
+
+  const scale = Math.min(w / sw, h / sh);
+  const dw = sw * scale;
+  const dh = sh * scale;
+  return {
+    source: { x: 0, y: 0, width: sw, height: sh },
+    dest: { x: (w - dw) / 2, y: (h - dh) / 2, width: dw, height: dh }
+  };
+}
+
+// The small canvas a texture renderer reads its source through. Assigning a
+// canvas's width or height, even the size it already has, throws its bitmap
+// away and resets its 2D context, and a look paints its sampler on every frame
+// it animates (audit F10). So the size is set only when it changes; at the
+// same size the bitmap is cleared and the drawing state the renderers rely on
+// is put back by hand, which is all that reset did for them.
+
+/** Sizes `sampler` to `width` x `height` and returns its cleared 2D context in the default state. */
+function sizeSampler(sampler, width, height) {
+  if (sampler.width !== width || sampler.height !== height) {
+    sampler.width = width;
+    sampler.height = height;
+    return sampler.getContext('2d', { willReadFrequently: true });
+  }
+  const context = sampler.getContext('2d', { willReadFrequently: true });
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.globalAlpha = 1;
+  context.globalCompositeOperation = 'source-over';
+  context.filter = 'none';
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = 'low';
+  context.shadowBlur = 0;
+  context.shadowOffsetX = 0;
+  context.shadowOffsetY = 0;
+  context.shadowColor = 'rgba(0, 0, 0, 0)';
+  context.clearRect(0, 0, width, height);
+  return context;
+}
+
+// Shared tonal equalisation for the screen-and-glyph engines.
+//
+// Lives here rather than inside one engine because ASCII and Dither Text hit
+// the same wall from opposite directions: one picks a glyph by threshold, the
+// other lets a pixel through an ordered gate, and BOTH compare the picture's
+// raw luminance against fixed numbers. That makes every preset a preset for the
+// one photograph it was authored on.
+
+// Prefixed rather than named `luminance`/`clamp01`: the standalone export
+// builders concatenate this module's source ahead of the engine's into one
+// script, and both engines already declare those two names at top level.
+//
+// Rec. 709. The eye reads ink coverage as brightness, so perceptual luminance —
+// not the arithmetic mean of the channels — is what keeps a saturated red from
+// being screened like the mid grey it is nowhere near in apparent lightness.
+const toneLuminance = (r, g, b) => (0.212599 * r + 0.715199 * g + 0.0721999 * b) / 255;
+const toneClamp01 = (n) => (n < 0 ? 0 : n > 1 ? 1 : n);
+
+/**
+ * The value that asks for the strength to be read off the picture itself.
+ * Controls expose it as the slider's lowest stop, below `0`, so the setting a
+ * visitor lands on is the one that adapts and the numbers above it are the
+ * manual override.
+ */
+const AUTO_LEVEL = 'auto';
+
+// Where the ramp opens and closes, measured on the 98th percentile of the
+// picture's luminance — the brightest tone that is a population rather than a
+// speck. Those two numbers are the whole judgement, so they are written down
+// with the evidence that set them (2026-09-22, 95 captures across the 19
+// published textures and an exposure ladder cut from the shipped photograph).
+//
+// p98 is the statistic that survived, and it beat the obvious candidates for a
+// reason: it is the only one that also gets a LIT SUBJECT ON BLACK right. The
+// median, the mean and the tonal range all read that frame as starved — it is
+// overwhelmingly black — and would have equalised a photograph that renders
+// perfectly today, lifting its background into mush. p98 sees the highlight on
+// the subject and leaves it alone. Measured: that frame scores p98 0.878, the
+// same as the well-exposed control, while -1.5 EV sits at 0.310 and -3 EV at
+// 0.110. Dark BACKGROUNDS were never the fault; crushed HIGHLIGHTS are.
+const HIGHLIGHT_LIT = 0.550001; // a picture with highlights here needs no help
+const HIGHLIGHT_STARVED = 0.249999; // nothing this side of shadow: equalise fully
+
+// The same judgement mirrored onto the other end, on the 2nd percentile.
+//
+// A washed-out or faded upload is the dark frame's twin: its highlights are
+// fine, so p98 waves it through, but it has no shadows left, and a gate that
+// inks the dark end (or the light end, once inverted) finds almost nothing on
+// one side of it. Measured 2026-09-26 on the Cobalt Plate preset: a high-key
+// frame (p02 0.784) under Auto inked 82.6% of the screen and the subject
+// dissolved into the ground, a faded print (p02 0.451) 64%.
+//
+// And as with p98, the percentile is what keeps the mirrored easy case right:
+// a SUBJECT ON WHITE is overwhelmingly white, but its p02 sits on the subject
+// (0.165) and it is left alone. The opening is set above every published
+// source that renders under Auto — contour-map's plate is the highest at p02
+// 0.282 — so no look in the catalogue moves; only lifted uploads do.
+const SHADOW_DEEP = 0.299999; // a picture with blacks down here needs no help
+const SHADOW_LIFTED = 0.599999; // nothing this side of a midtone: equalise fully
+
+/**
+ * How hard to equalise a picture that did not ask for a number.
+ *
+ * Zero for anything with highlights and shadows to spare, so a well-exposed
+ * upload renders exactly as it does today, and rising smoothly as either end
+ * collapses — the top end of a dark frame, the bottom end of a washed one. The
+ * curve between is a smoothstep rather than a line: a visitor nudging exposure
+ * across the opening of the ramp should not see the texture step.
+ *
+ * @param {(fraction: number) => number} at percentile lookup over the picture
+ * @returns {number} 0..1 strength for {@link autoLevelBands}
+ */
+function autoLevelStrength(at) {
+  const smoothstep = (t) => t * t * (3 - 2 * t);
+  const starved = toneClamp01((HIGHLIGHT_LIT - at(0.979999)) / (HIGHLIGHT_LIT - HIGHLIGHT_STARVED));
+  const lifted = toneClamp01((at(0.02) - SHADOW_DEEP) / (SHADOW_LIFTED - SHADOW_DEEP));
+  // Whichever end has collapsed further decides; a frame cannot be both.
+  return smoothstep(Math.max(starved, lifted));
+}
+
+/**
+ * Maps the picture's own tonal distribution onto the effect's fixed thresholds.
+ *
+ * Those thresholds are absolute — an ASCII ramp `'■▪·  '` changes glyph at
+ * 0.125, 0.375 and 0.625, a Bayer gate compares against its matrix — whatever
+ * the picture is, so a preset tuned on one photograph is tuned for that
+ * photograph only. Measured over five unrelated images, one ASCII preset inked
+ * between 38% and 85% of the grid: a bright picture came out nearly bare, a
+ * dark one filled solid. The three Dither Text looks published on 2026-09-20
+ * measured the same failure on the same five images, swinging 0.41 to 0.87 in
+ * coverage and filling 87-93% of the frame on a near-black source.
+ *
+ * Stretching the picture's percentile range onto 0..1 does not fix that, and
+ * the same five images proved it — the swing stayed at 0.49, because what
+ * decides how much ink falls is the SHAPE of the histogram, not its width. A
+ * dark-dominant photograph keeps most of its pixels under the threshold however
+ * far you stretch it.
+ *
+ * So this returns the picture's cumulative distribution instead: read a
+ * luminance, get back the fraction of the picture that is darker than it. That
+ * makes the values uniform by construction, and ink coverage becomes a property
+ * of the ramp or the gate — the share of it that is not blank — rather than of
+ * whatever the visitor happened to upload. `amount` blends back toward the raw
+ * tone, so a look can keep some of the original tonal character.
+ *
+ * A curve alone is not enough, and the two engines proved it from opposite
+ * sides. Equalisation sends every pixel of one input tone to a single output
+ * tone, so a photograph dominated by ONE tone — a subject on a white studio
+ * sweep, a subject on black, a flat sky — collapses its whole background onto
+ * a single point mid-range. Dither Text survives that because its Bayer and
+ * halftone gates compare each pixel against an ordered matrix, which spreads
+ * the tie out spatially by construction. ASCII picks a glyph by plain
+ * threshold, so the collapsed mass lands wholly inside one ramp slot; when that
+ * slot is part of the ramp's blank run the texture does not merely weaken, it
+ * disappears and the raw photograph shows through. Measured 2026-09-21: a raven
+ * on white rendered ZERO glyphs under `code-mist`, a horse on black zero under
+ * `arena-glyph`.
+ *
+ * So `span` reports how wide a band each input tone earns — its share of the
+ * picture. A caller that has an ordered matrix to hand offsets within that band
+ * (`curve[i] + span[i] * (ordered - 0.5)`) and the flat mass is rendered as a
+ * screen across the range it deserves instead of a single collapsed step. Ink
+ * coverage is unchanged, because the band is still occupied uniformly over
+ * pixels; what changes is that the ink lands.
+ *
+ * @param {Uint8ClampedArray} data RGBA pixels of a downsampled probe of the source
+ * @param {number|'auto'} amount 0 = identity curve, 1 = full equalisation,
+ *   `'auto'` = read the strength off the picture's own highlights and shadows
+ * @returns {{curve: Float32Array, span: Float32Array, level?: number}} 256-entry
+ *   lookup from 8-bit luminance to 0..1 tone, the width of the band each tone
+ *   earns, and (only when the picture was equalised) the strength used, so a
+ *   caller can scale its own correction by how far the curve moved
+ */
+function autoLevelBands(data, amount = 1) {
+  const auto = amount === AUTO_LEVEL;
+  const asked = auto ? 1 : toneClamp01(Number(amount) || 0);
+  const identity = Float32Array.from({ length: 256 }, (_, i) => i / 255);
+  const flat = new Float32Array(256);
+  // An explicit zero is the pinned presets' hot path — no histogram, no scan.
+  if (!auto && asked <= 0) return { curve: identity, span: flat };
+  const histogram = new Uint32Array(256);
+  let counted = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    // Contain margins are transparent and carry no picture; letting them vote
+    // would tell the curve that a third of every non-16:9 source is black.
+    if (data[i + 3] === 0) continue;
+    histogram[Math.round(toneLuminance(data[i], data[i + 1], data[i + 2]) * 255)] += 1;
+    counted += 1;
+  }
+  if (!counted) return { curve: identity, span: flat };
+  const at = (fraction) => {
+    const target = fraction * counted;
+    let seen = 0;
+    for (let i = 0; i < 256; i += 1) { seen += histogram[i]; if (seen >= target) return i / 255; }
+    return 1;
+  };
+  // A picture with no range to speak of — a mark on one flat colour, a fogged
+  // frame — has a CDF that is a single step, and equalising it turns sensor
+  // noise into a full-contrast dot storm. Leave those alone.
+  //
+  // Narrow range alone is not that test, though, and a badly underexposed
+  // photograph is what proves it: at -4.5 EV the shipped source spans 0.031,
+  // inside the cutoff, while still holding eleven populated levels of real
+  // subject. Refusing it was a cliff in the wrong direction — -3 EV equalised
+  // fully and the DARKER frame got nothing — so the frames this rejects must
+  // also be the ones with nowhere to spread: a lens cap occupies three levels,
+  // that photograph eleven.
+  const populated = histogram.reduce((n, count) => n + (count / counted >= 0.00200001 ? 1 : 0), 0);
+  if (at(0.98) - at(0.02) < 0.0499999 && populated < 6) return { curve: identity, span: flat };
+  // Only now, with the histogram in hand, does `'auto'` become a number. One
+  // scan serves both jobs: deciding whether to act and building what acts.
+  const level = auto ? autoLevelStrength(at) : asked;
+  if (level <= 0) return { curve: identity, span: flat };
+  const curve = new Float32Array(256);
+  const span = new Float32Array(256);
+  let seen = 0;
+  for (let i = 0; i < 256; i += 1) {
+    // Centre of the bin's span in the distribution, so a tone that occupies a
+    // large share of the picture lands in the middle of the band it earns
+    // rather than at its top edge.
+    const equalised = (seen + histogram[i] / 2) / counted;
+    seen += histogram[i];
+    curve[i] = identity[i] + (equalised - identity[i]) * level;
+    // The band that same tone earns. Scaled by `level` alongside the curve, so
+    // a partial auto-level spreads as gently as it equalises.
+    span[i] = (histogram[i] / counted) * level;
+  }
+  return { curve, span, level };
+}
+
+/**
+ * The curve alone, for callers with no ordered matrix to spread a band across.
+ * @returns {Float32Array} 256-entry lookup from 8-bit luminance to 0..1 tone
+ */
+function autoLevelCurve(data, amount = 1) {
+  return autoLevelBands(data, amount).curve;
+}
+
+/**
+ * The 256-entry transfer table an engine already builds, with the picture's own
+ * distribution folded in underneath it.
+ *
+ * Ten of the twelve texture engines open the same way — a table from 8-bit
+ * input to shaped tone, `Float32Array.from({length: 256}, (_, i) => xTone(i /
+ * 255, config))` — and then index it per pixel or per channel. Equalisation
+ * belongs exactly there, replacing the raw `i / 255` with what that tone is
+ * worth inside THIS picture, which is also why it lands ahead of the
+ * brightness/contrast/gamma the shape function applies: those controls then
+ * work on a known range instead of hunting for where this photograph sits.
+ *
+ * @param {Uint8ClampedArray} data RGBA pixels the engine already sampled
+ * @param {number|'auto'} amount the engine's `autoLevel` setting
+ * @param {(tone: number) => number} shape the engine's existing tone function
+ * @returns {Float32Array} 256-entry table, identical to today's at `0`
+ */
+function autoLevelTable(data, amount, shape) {
+  const curve = autoLevelCurve(data, amount);
+  return Float32Array.from({ length: 256 }, (_, i) => shape(curve[i]));
+}
+
+/**
+ * Reads an `autoLevel` setting out of saved state.
+ *
+ * Kept here rather than in each engine's own `number()` helper because the
+ * sentinel has to survive the trip through a shared link and a published
+ * config, and twelve normalisers each coercing it to a number is twelve ways
+ * for Auto to silently become zero.
+ *
+ * @param {unknown} value whatever the state carried
+ * @param {number|'auto'} fallback the engine's default
+ */
+function autoLevelSetting(value, fallback = AUTO_LEVEL) {
+  if (value === AUTO_LEVEL) return AUTO_LEVEL;
+  if (value == null || String(value).trim() === '') return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? toneClamp01(n) : fallback;
+}
+
+/**
+ * The Tone control every engine that reads raw luminance shares.
+ *
+ * Spelled once here because twelve copies of the same slider is twelve chances
+ * to disagree about its range. `'auto'` is the lowest stop rather than a
+ * separate checkbox: the scale then runs from "decide for me" through "leave it
+ * alone" to "equalise regardless", which is the order a visitor reaches for.
+ */
+const AUTO_LEVEL_CONTROL = {
+  section: 'Tone',
+  kind: 'slider',
+  key: 'autoLevel',
+  label: 'Auto level',
+  min: 0,
+  max: 1,
+  step: 0.0099999,
+  auto: AUTO_LEVEL
+};
+
+// Original split-field typography and ordered dithering. No vendor code/assets.
+
+const clamp = n => Math.max(0, Math.min(1, n));
+const rgb = hex => [1, 3, 5].map(i => parseInt(hex.slice(i, i + 2), 16));
+const css = c => `rgb(${c[0]},${c[1]},${c[2]})`;
+const BAYER2 = [0, 2, 3, 1];
+function bayer(x, y, size) {
+  let value = 0;
+  for (let bit = 1; bit < size; bit <<= 1) value = value * 4 + BAYER2[((y & bit) ? 2 : 0) + ((x & bit) ? 1 : 0)];
+  return (value + 0.5) / (size * size);
+}
+// Stable source-grid noise: no flicker on redraw or drift between exports.
+function grainAt(x, y) {
+  let n = Math.imul(x + 1, 374761393) ^ Math.imul(y + 1, 668265263);
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+// Median luminance where the high-key tone (`highKeyLevel`, `highKeyGamma`)
+// starts to take over, and where it has taken over fully.
+const HIGH_KEY_OPEN = .300001, HIGH_KEY_FULL = .500001;
+// `highKeyFrom: 'White backdrop'`: the 8-bit luminance band in which the
+// brightest flat tone of the probe starts and finishes counting as white, and
+// the share that flat tone has to hold for the high-key tone to start and to
+// take over fully.
+const WHITE_FROM = 220, WHITE_AT = 230, WHITE_OPEN = .2, WHITE_FULL = .299999;
+// The same backdrop lit unevenly (a sweep that falls from 255 to 245 across
+// the frame): the share of the frame's edge the plane is fitted on, the
+// luminance steps a backdrop pixel may differ from its neighbours two pixels
+// away and from the fitted plane, the share the spike of the levelled
+// picture has to hold to start and to take over fully, the share of
+// the twelve levels under it, against the spike, from which a hill (a white
+// room) starts and finishes shutting the blend, and the share of the edge
+// that has to lie on the plane to start and to finish opening it.
+const SWEEP_RING = .1, SWEEP_STEP = 1, SWEEP_FIT = 2, SWEEP_PASSES = 4, SWEEP_SAMPLES = 50;
+const SWEEP_OPEN = .149999, SWEEP_FULL = .249999, SWEEP_HILL = .320001, SWEEP_HILL_SHUT = .399999, SWEEP_PLANE = .499999, SWEEP_PLANE_FULL = .600001;
+// Share of the frame left transparent from which `cutoutGround` votes in full.
+const CUTOUT_FULL = .250001;
+// A 64x64 blue-noise threshold mask, built once by void-and-cluster (Ulichney
+// 1993) from a seed pattern drawn with `grainAt`. Each pixel still inks with a
+// probability equal to its tone, as with Stardust, but neighbouring thresholds
+// are as far apart as possible, so the dots spread evenly at every density
+// instead of clumping into the loose dust white noise gives. The Gaussian
+// weights are integers, so every energy sum is exact and the ranking (hence
+// every dot) is the same in every browser and on every redraw.
+const BLUE = 64;
+let blueMask = null;
+function blueNoiseMask() {
+  if (blueMask) return blueMask;
+  const area = BLUE * BLUE, radius = 6, kernel = [];
+  for (let dy = -radius; dy <= radius; dy++) for (let dx = -radius; dx <= radius; dx++) {
+    kernel.push(dx, dy, Math.round(1e6 * Math.exp(-(dx * dx + dy * dy) / 4.50001)));
+  }
+  const energy = new Float64Array(area), on = new Uint8Array(area), rank = new Float32Array(area);
+  const splat = (i, sign) => {
+    const x = i % BLUE, y = (i - x) / BLUE;
+    for (let k = 0; k < kernel.length; k += 3) energy[((y + kernel[k + 1] + BLUE) % BLUE) * BLUE + (x + kernel[k] + BLUE) % BLUE] += sign * kernel[k + 2];
+  };
+  // Tightest cluster: the set pixel with the most energy; largest void: the
+  // empty one with the least. Ties go to the lower index.
+  const extreme = (state, most) => {
+    let best = -1;
+    for (let i = 0; i < area; i++) if (on[i] === state && (best < 0 || (most ? energy[i] > energy[best] : energy[i] < energy[best]))) best = i;
+    return best;
+  };
+  let ones = 0;
+  for (let i = 0; i < area; i++) if (grainAt(i % BLUE, Math.floor(i / BLUE)) < 0.100001) { on[i] = 1; splat(i, 1); ones++; }
+  // Relax the seed until moving its tightest dot into its largest void
+  // changes nothing.
+  for (let guard = 0; guard < area; guard++) {
+    const cluster = extreme(1, true); on[cluster] = 0; splat(cluster, -1);
+    const voidAt = extreme(0, false); on[voidAt] = 1; splat(voidAt, 1);
+    if (voidAt === cluster) break;
+  }
+  const seed = on.slice(), seedEnergy = energy.slice();
+  for (let r = ones - 1; r >= 0; r--) { const i = extreme(1, true); on[i] = 0; splat(i, -1); rank[i] = r; }
+  on.set(seed); energy.set(seedEnergy);
+  for (let r = ones; r < area; r++) { const i = extreme(0, false); on[i] = 1; splat(i, 1); rank[i] = r; }
+  for (let i = 0; i < area; i++) rank[i] = (rank[i] + 0.5) / area;
+  return (blueMask = rank);
+}
+
+function ditherGate(x, y, style) {
+  if (style === '1-bit threshold') return 0.500001;
+  if (style === 'Blue noise') return blueNoiseMask()[(y % BLUE) * BLUE + (x % BLUE)];
+  // A random threshold per pixel instead of an ordered one: each pixel inks
+  // with a probability equal to its tone, so the screen reads as loose dust
+  // (clumps, gaps, lone specks) rather than a lattice. Same stable noise as
+  // film grain, so a redraw or an export lands every speck in the same place.
+  if (style === 'Stardust') return grainAt(x, y);
+  if (style === 'Halftone circle') {
+    const dx = ((x % 6) + 0.500001) / 6 - 0.5, dy = ((y % 6) + 0.5) / 6 - 0.500001;
+    return clamp(1 - (dx * dx + dy * dy) * Math.PI);
+  }
+  return bayer(x, y, style === 'Bayer 2x2' ? 2 : style === 'Bayer 4x4' ? 4 : 8);
+}
+
+// `Scaled` type: an italic serif whose size follows the tone instead of a fixed
+// monospace cell. `depth` is how far a cell sits past the split threshold on
+// the text side, so the same code serves both split modes: 0 at the edge of the
+// type field, 1 at its brightest (or darkest) point. Shallow cells are thinned
+// through a 4×4 Bayer gate so a subject fades out at its edge instead of ending
+// on a hard contour of small glyphs, and deep cells grow past their cell and
+// overlap, which is what reads as light.
+const SCALED_MIN = 0.899999, SCALED_MAX = 3, SCALED_THIN = 0.249999, SCALED_STEPS = 32;
+const SCALED_FACE = '"Times New Roman", Times, "Liberation Serif", "Nimbus Roman", serif';
+function drawScaledType(ctx, config, text, textCells, tones, inkAt, { cols, rows, qw, qh, ox, oy, cw, ch }) {
+  const highlights = config.splitMode === 'Text in highlights', t = config.threshold;
+  const buckets = Array.from({ length: SCALED_STEPS }, () => []);
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (!textCells[y * cols + x]) continue;
+    const sx = Math.min(qw - 1, Math.floor((x + .500001) * qw / cols)), sy = Math.min(qh - 1, Math.floor((y + .5) * qh / rows)), i = sy * qw + sx;
+    const depth = clamp(highlights ? (tones[i] - t) / (1 - t) : (t - tones[i]) / t);
+    if (depth <= bayer(x, y, 4) * SCALED_THIN) continue;
+    buckets[Math.min(SCALED_STEPS - 1, Math.floor(depth ** 1.60001 * SCALED_STEPS))].push(x, y, i);
+  }
+  // Smallest first, so a large glyph lands on top of the fine ones it covers.
+  buckets.forEach((cells, step) => {
+    if (!cells.length) return;
+    ctx.font = `italic 400 ${ch * (SCALED_MIN + (SCALED_MAX - SCALED_MIN) * (step + .5) / SCALED_STEPS)}px ${SCALED_FACE}`;
+    for (let k = 0; k < cells.length; k += 3) {
+      const x = cells[k], y = cells[k + 1];
+      ctx.fillStyle = css(inkAt(cells[k + 2]));
+      // Each row reads the sequence in order from its own fixed offset. Any
+      // offset linear in the row (Print's `y * cols + x`, or `x + y`) lines
+      // the same digit up along a diagonal or a column, and a `0` carries far
+      // more ink than a `1`, so the frame shows stripes the picture does not have.
+      ctx.fillText(text[(x + Math.floor(grainAt(0, y) * text.length)) % text.length], ox + (x + .500001) * cw, oy + (y + .5) * ch);
+    }
+  });
+}
+
+// Cross flares on the picture's point lights, drawn into the screened raster
+// in the ink itself, so a fixed-ink look stays exactly two colours. A star is
+// a place brighter than ALL FOUR boxes beside it (left, right, above, below):
+// a bright area or a sky has no dark side, and the lit edge of a cloud or a
+// face has a bright one, so neither gets a star; only an isolated point does.
+// One candidate per cell, kept only if it beats its eight neighbouring cells. The core is solid; each of the four arms thins
+// through the style's own gate, so it fades out as stipple, as in an
+// engraving. `density` is the share of ink a raster pixel asks for.
+const FLARE_CORE = 0.599999, FLARE_PROMINENCE = 0.249999, FLARE_MAX = 12;
+function drawStarFlares(out, density, qw, qh, amount, gateAt, inkAt) {
+  const sum = new Float64Array((qw + 1) * (qh + 1));
+  for (let y = 0; y < qh; y++) {
+    let row = 0;
+    for (let x = 0; x < qw; x++) { row += density[y * qw + x]; sum[(y + 1) * (qw + 1) + x + 1] = sum[y * (qw + 1) + x + 1] + row; }
+  }
+  const box = (x, y, r) => {
+    const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r), x1 = Math.min(qw, x + r + 1), y1 = Math.min(qh, y + r + 1);
+    return (sum[y1 * (qw + 1) + x1] - sum[y0 * (qw + 1) + x1] - sum[y1 * (qw + 1) + x0] + sum[y0 * (qw + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+  };
+  const reach = Math.max(6, Math.round(qw / 64)), cell = Math.max(8, Math.round(qw / 48));
+  const gx = Math.ceil(qw / cell), gy = Math.ceil(qh / cell);
+  const best = new Float64Array(gx * gy), at = new Int32Array(gx * gy).fill(-1);
+  for (let y = 0; y < qh; y++) for (let x = 0; x < qw; x++) {
+    const core = box(x, y, 1);
+    if (core < FLARE_CORE) continue;
+    // Two scales, so a star with a wide glow is found as well as a pin
+    // point; at each, the inner box is a quarter of the reach, so a wider
+    // light is flared at its centre rather than at its first lit pixel.
+    let prominence = -1;
+    for (const r of [reach, reach * 2]) {
+      const h = r >> 1, around = Math.max(box(x - r, y, h), box(x + r, y, h), box(x, y - r, h), box(x, y + r, h));
+      prominence = Math.max(prominence, box(x, y, Math.max(1, r >> 2)) - around);
+    }
+    const c = Math.floor(y / cell) * gx + Math.floor(x / cell);
+    if (prominence >= FLARE_PROMINENCE && prominence > best[c]) { best[c] = prominence; at[c] = y * qw + x; }
+  }
+  const put = (x, y, ink) => {
+    if (x < 0 || y < 0 || x >= qw || y >= qh) return;
+    const o = (y * qw + x) * 4;
+    out[o] = ink[0]; out[o + 1] = ink[1]; out[o + 2] = ink[2]; out[o + 3] = 255;
+  };
+  const stars = [];
+  for (let cy = 0; cy < gy; cy++) for (let cx = 0; cx < gx; cx++) {
+    const c = cy * gx + cx;
+    if (at[c] < 0) continue;
+    let top = true;
+    for (let ny = Math.max(0, cy - 1); ny <= Math.min(gy - 1, cy + 1) && top; ny++) for (let nx = Math.max(0, cx - 1); nx <= Math.min(gx - 1, cx + 1); nx++) {
+      const n = ny * gx + nx;
+      if (n !== c && at[n] >= 0 && (best[n] > best[c] || (best[n] === best[c] && n < c))) { top = false; break; }
+    }
+    if (top) stars.push(c);
+  }
+  // Only the strongest few flare, as through a star filter: a lit street or
+  // a white wall has hundreds of bright points, and crossing them all turns
+  // the accent into a pattern. Ties go to the earlier cell, so the pick never
+  // flickers between frames.
+  stars.sort((a, b) => best[b] - best[a] || a - b);
+  for (const c of stars.slice(0, FLARE_MAX)) {
+    const i = at[c], x = i % qw, y = (i - x) / qw, ink = inkAt(i);
+    const strength = clamp((best[c] - FLARE_PROMINENCE) / 0.5);
+    const arm = Math.round(amount * (.350001 + .65 * strength) * qw * 0.0549999), core = Math.round(1 + strength * 1.49999);
+    for (let dy = -core; dy <= core; dy++) for (let dx = -core; dx <= core; dx++) if (dx * dx + dy * dy <= core * core + 1) put(x + dx, y + dy, ink);
+    // Each arm is solid through its inner half or so (three pixels thick near the
+    // core) and thins out through the gate beyond it. The vertical arms run
+    // longer, the way a lens draws a star.
+    const arms = [[1, 0, arm], [-1, 0, arm], [0, 1, Math.round(arm * 1.39999)], [0, -1, Math.round(arm * 1.39999)]];
+    for (const [ux, uy, length] of arms) for (let d = core + 1; d <= length; d++) {
+      const t = d / (length + 1), px = x + ux * d, py = y + uy * d;
+      if (t < .55 || (1 - t) ** 1.19999 > gateAt(px, py)) put(px, py, ink);
+      if (t < .199999) { put(px + uy, py + ux, ink); put(px - uy, py - ux, ink); }
+    }
+  }
+}
+
+// How far a probe reads as a light subject on a white backdrop that is lit
+// unevenly, from 0 to 1 (see `highKeyFrom: 'White backdrop'` below). The
+// backdrop is found where it sits, in the edge of the frame: its flat light
+// pixels there are fitted with a plane, refitted on the pixels that lie on it,
+// and the plane's slope is taken out of the whole probe, which turns the sweep
+// back into one flat tone that the spike test reads as for an even backdrop.
+function sweepBackdropKey(probe, qw, qh) {
+  const smooth = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); };
+  const n = qw * qh, luma = new Uint8Array(n);
+  for (let i = 0; i < n; i++) luma[i] = Math.min(255, Math.round(probe[i * 4] * .212599 + probe[i * 4 + 1] * .715199 + probe[i * 4 + 2] * .0722001));
+  const r = Math.max(1, Math.round(Math.min(qw, qh) * SWEEP_RING));
+  const ring = [], samples = [];
+  for (let y = 0; y < qh; y++) for (let x = 0; x < qw; x++) {
+    // Only the edge: the rows of its top and bottom bands, the ends of the rest.
+    if (x === r && y >= r && y < qh - r && qw - r > r) x = qw - r;
+    const i = y * qw + x;
+    ring.push(i);
+    if (probe[i * 4 + 3] === 0 || luma[i] < WHITE_FROM || x + 2 >= qw || y + 2 >= qh) continue;
+    if (Math.abs(luma[i + 2] - luma[i]) <= SWEEP_STEP && Math.abs(luma[i + 2 * qw] - luma[i]) <= SWEEP_STEP) samples.push(i);
+  }
+  if (samples.length <= SWEEP_SAMPLES) return 0;
+  const X = (i) => (i % qw + .500001) / qw - .5, Y = (i) => (Math.floor(i / qw) + .5) / qh - .500001;
+  let plane = null, fit = samples;
+  for (let pass = 0; pass < SWEEP_PASSES; pass++) {
+    // Least squares for luma = a + b x + c y, by its normal equations.
+    let s1 = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, syy = 0, sl = 0, sxl = 0, syl = 0;
+    for (const i of fit) {
+      const x = X(i), y = Y(i), l = luma[i];
+      s1 += 1; sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y; sl += l; sxl += x * l; syl += y * l;
+    }
+    const det = s1 * (sxx * syy - sxy * sxy) - sx * (sx * syy - sxy * sy) + sy * (sx * sxy - sxx * sy);
+    if (!(Math.abs(det) > 1e-9)) return 0;
+    const solve = (c0, c1, c2) => (c0[0] * (c1[1] * c2[2] - c1[2] * c2[1]) - c1[0] * (c0[1] * c2[2] - c0[2] * c2[1]) + c2[0] * (c0[1] * c1[2] - c0[2] * c1[1])) / det;
+    const col0 = [s1, sx, sy], col1 = [sx, sxx, sxy], col2 = [sy, sxy, syy], rhs = [sl, sxl, syl];
+    plane = [solve(rhs, col1, col2), solve(col0, rhs, col2), solve(col0, col1, rhs)];
+    const [a, b, c] = plane;
+    if (pass < SWEEP_PASSES - 1) fit = samples.filter((i) => Math.abs(luma[i] - (a + b * X(i) + c * Y(i))) <= SWEEP_FIT);
+  }
+  const [a, b, c] = plane;
+  let onPlane = 0;
+  for (const i of ring) if (probe[i * 4 + 3] !== 0 && Math.abs(luma[i] - (a + b * X(i) + c * Y(i))) <= SWEEP_FIT) onPlane += 1;
+  const planar = onPlane / ring.length;
+  if (planar <= SWEEP_PLANE) return 0;
+  // The levelled histogram: the slope out, the plane's mean level kept.
+  const histogram = new Uint32Array(256);
+  let counted = 0;
+  for (let i = 0; i < probe.length; i += 4) {
+    if (probe[i + 3] === 0) continue;
+    const p = i / 4;
+    const l = p < n ? Math.round(luma[p] - b * X(p) - c * Y(p)) : Math.round(probe[i] * .2126 + probe[i + 1] * .715199 + probe[i + 2] * .0722);
+    histogram[Math.max(0, Math.min(255, l))] += 1;
+    counted += 1;
+  }
+  let top = WHITE_FROM, above = 0, hill = 0;
+  for (let l = WHITE_FROM + 1; l < 256; l++) if (histogram[l] > histogram[top]) top = l;
+  for (let l = top + 2; l < 256; l++) above += histogram[l];
+  for (let l = Math.max(0, top - 12); l < top - 1; l++) hill += histogram[l];
+  const spike = (histogram[top - 1] + histogram[top] + (top < 255 ? histogram[top + 1] : 0) - 2 * above) / counted;
+  if (spike <= SWEEP_OPEN) return 0;
+  return smooth((spike - SWEEP_OPEN) / (SWEEP_FULL - SWEEP_OPEN)) * smooth((top - WHITE_FROM) / (WHITE_AT - WHITE_FROM))
+    * (1 - smooth((hill / counted / spike - SWEEP_HILL) / (SWEEP_HILL_SHUT - SWEEP_HILL)))
+    * smooth((planar - SWEEP_PLANE) / (SWEEP_PLANE_FULL - SWEEP_PLANE));
+}
+
+function renderDitherTextFrame(canvas, source, config, { width, height, pixelRatio = 1, sampler, preview = false } = {}) {
+  const w = Math.max(1, Math.round(width ?? canvas.width)), h = Math.max(1, Math.round(height ?? canvas.height));
+  const dpr = Math.max(1, pixelRatio);
+  if (canvas.width !== Math.round(w * dpr)) canvas.width = Math.round(w * dpr);
+  if (canvas.height !== Math.round(h * dpr)) canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d', { alpha: true });
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.clearRect(0, 0, w, h);
+  const sw = source?.videoWidth || source?.naturalWidth, sh = source?.videoHeight || source?.naturalHeight;
+  if (!sw || !sh) return;
+  const { source: crop, dest } = frameSource(w, h, sw, sh, sourceFit(config));
+  const dw = dest.width, dh = dest.height, ox = dest.x, oy = dest.y;
+  // A fixed editorial grid keeps type scale independent of export resolution.
+  const cols = Math.max(2, Math.round(1600 / config.cellSize)), rows = Math.max(2, Math.min(2048, Math.round(cols * crop.height / crop.width)));
+  // The authored raster (`aw` × `ah`): where the screen's gates and grain
+  // sit. An export samples the source at that raster.
+  const aw = Math.min(1920, Math.round(1920 / config.ditherPixelSize)), ah = Math.max(1, Math.min(2048, Math.round(aw * crop.height / crop.width)));
+  // A preview samples no more pixels than its canvas has: the default 960-wide
+  // raster on a 640-wide card is 2.25 times the pixels the card can show (audit
+  // F07). The raster is sampled at the canvas's size instead, and each of its
+  // pixels takes its gate, grain and type cell from the authored pixel the card
+  // showed, so the screen keeps its period, phase and character grid. Only
+  // while the authored raster is under twice the canvas: drawn smaller than
+  // that, the browser averages it (the screen reads as grey), and a raster at
+  // the canvas's size would show crisp dots there instead.
+  const target = Math.max(1, Math.ceil(dw * dpr));
+  const qw = preview && aw < 2 * target ? Math.min(aw, target) : aw;
+  const qh = qw === aw ? ah : Math.max(1, Math.min(ah, Math.round(ah * qw / aw)));
+  sampler ??= document.createElement('canvas');
+  const sctx = sizeSampler(sampler, qw, qh);
+  const softness = Math.max(0, Math.min(20, Number(config.softness) || 0));
+  sctx.filter = softness ? `blur(${softness * qw / 1920}px)` : 'none';
+  sctx.drawImage(source, crop.x, crop.y, crop.width, crop.height, 0, 0, qw, qh);
+  sctx.filter = 'none';
+  const pixels = sctx.getImageData(0, 0, qw, qh).data;
+  // Authored column and row of each raster pixel: the identity for an export.
+  const authoredX = new Int32Array(qw), authoredY = new Int32Array(qh);
+  for (let x = 0; x < qw; x++) authoredX[x] = qw === aw ? x : Math.min(aw - 1, Math.floor((x + .499999) * aw / qw));
+  for (let y = 0; y < qh; y++) authoredY[y] = qh === ah ? y : Math.min(ah - 1, Math.floor((y + .500001) * ah / qh));
+  // Every gate below — the Bayer matrix, the halftone circle, the 1-bit cut —
+  // is a fixed number, so without this the preset only screens correctly the
+  // one photograph it was authored on. The curve maps the picture's own
+  // distribution onto those numbers; at `autoLevel: 0` it is the identity, so
+  // a look that does not opt in renders exactly as it always did.
+  //
+  // `levelFrom: 'Lit subject'` levels the picture from what lies above the
+  // shadow floor only. Equalising a small subject on black otherwise hands
+  // the backdrop most of the range and squeezes the subject's own shading
+  // into the top few levels, so a side-lit pear comes out as a flat cut-out.
+  // The backdrop then does not vote, as contain margins already do not; the
+  // floor still keeps it black. Off (the default), the probe is the frame.
+  const levelCut = config.levelFrom === 'Lit subject' ? Math.max(0, Math.min(.499999, Number(config.shadowFloor) || 0)) * 255 : 0;
+  let probe = pixels;
+  if (levelCut > 0) {
+    probe = new Uint8ClampedArray(pixels);
+    for (let i = 0; i < probe.length; i += 4) if (probe[i] * .212601 + probe[i + 1] * .7152 + probe[i + 2] * .0721999 < levelCut) probe[i + 3] = 0;
+  }
+  // A cutout's transparent ground shows as empty page around the subject, and
+  // the curve, which never sees it, sends the subject's own darkest share to 0:
+  // the same level as that empty ground. A light subject whose darker parts are
+  // its features (a face under blonde hair, a red mark beside pale bars) then
+  // loses them into the page. `cutoutGround` adds that share of black votes to
+  // the probe, so the subject is levelled into the range above the ground.
+  // The votes scale with how much of the frame the source leaves transparent
+  // (in full from CUTOUT_FULL of it), so a tall phone crop that fills with
+  // the subject is lifted as much as a wide one, while an opaque picture
+  // (every cover, every photograph) is untouched; at 0 (the default) the probe
+  // is exactly the old one.
+  const groundShare = Math.max(0, Math.min(.499999, Number(config.cutoutGround) || 0));
+  if (groundShare > 0) {
+    let subject = 0, empty = 0;
+    for (let i = 0; i < probe.length; i += 4) {
+      if (pixels[i + 3] === 0) empty += 1;
+      else if (probe[i + 3] !== 0) subject += 1;
+    }
+    const cutout = Math.min(1, empty / (pixels.length / 4) / CUTOUT_FULL);
+    const votes = Math.round(subject * groundShare / (1 - groundShare) * cutout);
+    if (votes > 0) {
+      const voted = new Uint8ClampedArray(probe.length + votes * 4);
+      voted.set(probe);
+      for (let i = probe.length + 3; i < voted.length; i += 4) voted[i] = 255;
+      probe = voted;
+    }
+  }
+  // Equalising a low-key frame lifts its black majority to the middle of the
+  // curve: the mass of near-black pixels lands at the centre of the share it
+  // holds, so a subject on black becomes a light shape on a mid-grey screen.
+  // `blackHold` holds the darkest share of an equalised picture at black and
+  // spreads the rest over the full range above it. It is scaled by how hard the
+  // picture was equalised, so a frame Auto leaves alone is untouched, and at 0
+  // (the default) the curve is used exactly as before.
+  //
+  // `blackHold` and `shadowFloor` both darken the low end but act on different
+  // numbers, in this order (no published look sets both):
+  //   1. `levelFrom: 'Lit subject'` drops pixels under `shadowFloor` from the
+  //      probe, so the curve, and the strength the hold reads, come from the
+  //      lit subject only.
+  //   2. `blackHold` re-maps that curve in the LEVELLED domain: its darkest
+  //      `blackHold x strength` goes to 0 and the rest is re-spread to 0..1.
+  //   3. Gamma, then the tone window below: `shadowFloor` fades a tone by the
+  //      pixel's RAW luminance, `highlightCeiling` caps the top; then the
+  //      inset, then invert.
+  // Each step is a non-decreasing map of luminance and both only pull tones
+  // toward 0, so together the tone stays monotone: a pixel the hold sends to
+  // black stays black, and the floor's fade scales whatever the hold left.
+  const blackHold = Math.max(0, Math.min(.9, Number(config.blackHold) || 0));
+  let levels;
+  if (blackHold) {
+    const { curve, level = 0 } = autoLevelBands(probe, config.autoLevel);
+    const held = blackHold * level;
+    levels = held ? curve.map(c => c <= held ? 0 : (c - held) / (1 - held)) : curve;
+  } else levels = autoLevelCurve(probe, config.autoLevel);
+  // High-key tone, for looks whose preset is tuned on dark pictures and loses
+  // its subject on light ones. `highKeyLevel` and `highKeyGamma` are what the
+  // look uses on a high-key picture instead of `autoLevel` and `gamma`; at
+  // `'auto'` (the default) each follows the look's own control, and with both
+  // there this block is skipped, so every look that does not opt in renders
+  // byte for byte.
+  //
+  // A picture counts as high-key by the median luminance of the same probe the
+  // curve reads (the lit subject under `levelFrom: 'Lit subject'`), blended in
+  // with a smoothstep from HIGH_KEY_OPEN to HIGH_KEY_FULL so a picture near the
+  // edge does not step. Measured 2026-11-09 at the 744x872 and 390x789 editor
+  // stages and the 1920x1080 cover frame: the Flare, Silt and Cyanotype cover
+  // sources and the four dark test frames sit at medians 0.00-0.25, every light
+  // test image at 0.49 or above, so the dark end and the covers are untouched.
+  //
+  // `highKeyFrom: 'White backdrop'` keys the same blend on a studio backdrop
+  // instead, for a look whose own tone already reads ordinary light
+  // photographs. A light subject on a white sweep is the darkest share of its
+  // frame, so equalisation ranks it at the bottom of the curve whatever its own
+  // brightness, and a strong gamma then prints it as an empty silhouette.
+  //
+  // The backdrop is read by its shape, not by a fixed white point, so it is
+  // found at any exposure from clipped 255 down to off-white: it is the
+  // brightest flat tone of the frame, one narrow spike at the top of the
+  // histogram with next to nothing above it. The spike is the share within one
+  // level of the most common tone from WHITE_FROM up, less twice the share
+  // above that; it opens the blend from WHITE_OPEN to WHITE_FULL, and the
+  // spike's level fades it in from WHITE_FROM to WHITE_AT, so a grey card is
+  // not white and neither step is a cliff. A white room or a snowfield is as
+  // light, but as a broad hill with lighter tones above its peak, and stays
+  // shut. Measured 2026-11-09 at the 744x872 and 390x789@3 editor stages and
+  // the 1920x1080 cover frame: the white vase and the portrait on white score
+  // 0.35-0.81 with the backdrop at 255, 247, 240 or 235; every other test
+  // picture, light-v2 picture and cover 0.14 or less, light-interior and
+  // light-snow included, also with their exposure lowered.
+  //
+  // A backdrop lit unevenly, one that falls from 255 to 245 across the frame,
+  // spreads that spike over ten levels, so the light subject on it read as a
+  // light frame and printed as a black silhouette. Where the spike test stays
+  // under 1, `sweepBackdropKey` reads the backdrop again from where it sits,
+  // in the edge of the frame: a plane fitted on the edge's flat light pixels,
+  // its slope taken out of the probe, and the spike test run on what is left.
+  // It needs the edge to lie on that plane, which a snowfield's does not, and
+  // nearly nothing in the twelve levels under the spike, where a white room
+  // keeps the shoulder of its hill. The larger of the two weights is used, so
+  // a picture the spike test already opens is unchanged. Measured 2026-11-09
+  // at the same three stages on the vase and the portrait with the backdrop
+  // falling 2-8% top to bottom or left to right, also from 247 and 240: all
+  // at 1; the weight of every other test picture, light-v2 picture, cover,
+  // white room and snowfield, also lit with the same falls, is unchanged.
+  const keyLevel = typeof config.highKeyLevel === 'number' ? config.highKeyLevel : null;
+  const keyGamma = typeof config.highKeyGamma === 'number' ? config.highKeyGamma : null;
+  let highKey = 0, keyLevels = levels;
+  if (keyLevel !== null || keyGamma !== null) {
+    const histogram = new Uint32Array(256);
+    let counted = 0;
+    for (let i = 0; i < probe.length; i += 4) {
+      if (probe[i + 3] === 0) continue;
+      histogram[Math.min(255, Math.round(probe[i] * .212601 + probe[i + 1] * .7152 + probe[i + 2] * .0722001))] += 1;
+      counted += 1;
+    }
+    const smooth = (t) => { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); };
+    if (counted && config.highKeyFrom === 'White backdrop') {
+      let top = WHITE_FROM, above = 0;
+      for (let l = WHITE_FROM + 1; l < 256; l++) if (histogram[l] > histogram[top]) top = l;
+      for (let l = top + 2; l < 256; l++) above += histogram[l];
+      const spike = (histogram[top - 1] + histogram[top] + (top < 255 ? histogram[top + 1] : 0) - 2 * above) / counted;
+      highKey = smooth((spike - WHITE_OPEN) / (WHITE_FULL - WHITE_OPEN)) * smooth((top - WHITE_FROM) / (WHITE_AT - WHITE_FROM));
+      if (highKey < 1) highKey = Math.max(highKey, sweepBackdropKey(probe, qw, qh));
+    } else if (counted) {
+      let median = 0;
+      for (let seen = 0; median < 255 && (seen += histogram[median]) < counted / 2;) median += 1;
+      highKey = smooth((median / 255 - HIGH_KEY_OPEN) / (HIGH_KEY_FULL - HIGH_KEY_OPEN));
+    }
+    if (highKey > 0 && keyLevel !== null) keyLevels = autoLevelCurve(probe, keyLevel);
+  }
+  const keyGammaValue = keyGamma ?? config.gamma;
+  // Pulls both ends of the tonal range in from pure paper and pure ink, so the
+  // ordered screen never clears or closes completely: the whitest part of the
+  // picture still carries a sparse lattice of ink and the blackest a sparse
+  // lattice of paper, as on a coarse print screen. At 0 the tones are exactly
+  // the old ones.
+  const inset = Math.max(0, Math.min(.499999, Number(config.screenInset) || 0));
+  // A window on the tone, for looks whose light end is the ink: points of
+  // light on black. Without it a light photograph's white backdrop asks for
+  // ink everywhere and the frame closes into one sheet. The ceiling is the
+  // print shop's coverage limit: a quadratic shoulder whose slope meets the
+  // straight part, so the brightest tones still order but stop at `ceiling`.
+  //
+  // The floor is a black point on the picture's OWN luminance, read before
+  // auto-level. It has to be: a subject on black is starved, so auto-level
+  // equalises it, and equalising parks the black backdrop mid-band (the
+  // centre of the share it holds), where it would sprinkle light over the
+  // ground. A floor read after the curve cannot tell that black from real
+  // dim detail. Tones fade in over one more floor's width, so no edge forms.
+  // The window shapes the picture's tone and the inset comes after it, so the
+  // inset's sparse lattice still survives in a floored black. At 1 and 0 (the
+  // defaults) the window is skipped and the tones are exactly the old ones.
+  const ceiling = Math.max(.0500001, Math.min(1, config.highlightCeiling ?? 1)), floor = Math.max(0, Math.min(.500001, Number(config.shadowFloor) || 0));
+  const knee = Math.max(0, 2 * ceiling - 1);
+  const windowed = ceiling < 1 || floor > 0;
+  const toneWindow = (v, lum) => {
+    const t0 = floor > 0 ? Math.max(0, Math.min(1, (lum - floor) / floor)) : 1;
+    const shown = v * t0 * t0 * (3 - 2 * t0);
+    if (shown <= knee) return shown;
+    const t = (shown - knee) / (1 - knee);
+    return knee + (ceiling - knee) * (1 - (1 - t) * (1 - t));
+  };
+  const tones = new Float32Array(qw * qh);
+  // A screened Toned look colours each dot by the picture's levelled tone,
+  // before gamma and the window: those two set how many dots a tone gets, not
+  // how bright they are, so sparse shadow grains stay dim and dense highlight
+  // grains near-white.
+  const shades = config.colorMode === 'Toned' && config.ditherStyle !== 'Film grain' ? new Float32Array(qw * qh) : null;
+  for (let i = 0; i < tones.length; i++) {
+    const lum = Math.min(255, Math.round(pixels[i * 4] * .212599 + pixels[i * 4 + 1] * .715199 + pixels[i * 4 + 2] * .0721999));
+    let raw = levels[lum], curved = Math.pow(raw, 1 / config.gamma);
+    if (highKey > 0) {
+      const keyRaw = keyLevels[lum];
+      curved += (Math.pow(keyRaw, 1 / keyGammaValue) - curved) * highKey;
+      raw += (keyRaw - raw) * highKey;
+    }
+    const v = inset + (windowed ? toneWindow(curved, lum / 255) : curved) * (1 - 2 * inset);
+    tones[i] = config.invert === 'on' ? 1 - v : v;
+    if (shades) shades[i] = config.invert === 'on' ? 1 - raw : raw;
+  }
+  const marquee = config.typeStyle === 'Marquee';
+  // Scaled type is the whole picture: the glyphs carry every tone, so the
+  // untyped cells are bare paper rather than a screen. Screening them would
+  // also ink single bright pixels inside cells the type decided were dark.
+  const scaled = config.typeStyle === 'Scaled';
+  const textCells = new Uint8Array(cols * rows);
+  const ditherOnly = config.splitMode === 'Dither only';
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (ditherOnly) continue;
+    const sx = Math.min(qw - 1, Math.floor((x + .500001) * qw / cols)), sy = Math.min(qh - 1, Math.floor((y + .5) * qh / rows));
+    const v = tones[sy * qw + sx];
+    textCells[y * cols + x] = config.splitMode === 'Text in highlights' ? v >= config.threshold : v < config.threshold;
+  }
+  const fg = rgb(config.foreground), bg = rgb(config.background);
+  // `Luminous` inks every dot in the picture's hue at full brightness (the
+  // pixel scaled until its strongest channel is 255), so a dim part of the
+  // picture gets fewer dots rather than darker ones: how bright a place is
+  // stays the screen's job alone, and each dot reads as a point of light. Near
+  // black the hue is mostly noise, so the dot fades to `foreground` there, the
+  // same guard `Tinted` uses for its paper.
+  const luminousAt = i => {
+    const r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2], top = Math.max(r, g, b), sure = Math.min(1, top / 32);
+    return [r, g, b].map((c, k) => Math.round(fg[k] + (c * 255 / (top || 1) - fg[k]) * sure));
+  };
+  const inkAt = i => config.colorMode === 'Original' ? [pixels[i * 4], pixels[i * 4 + 1], pixels[i * 4 + 2]]
+    : config.colorMode === 'Multi' ? fg.map((c, k) => Math.round(c * .650001 + pixels[i * 4 + k] * .350001))
+      : config.colorMode === 'Luminous' ? luminousAt(i) : fg;
+  // `Tinted` is `Multi` turned round: the ink stays the one foreground and the
+  // paper takes the picture's hue. The hue is read at full brightness (the
+  // pixel scaled until its strongest channel is 255), so a shaded cloud tints
+  // the paper pale blue rather than darkening it: how dark a place is stays the
+  // screen's job alone. Near black the hue is mostly noise, so it fades to
+  // white there: a black backdrop gets the same paper as a white one instead
+  // of a grey one, or a speckle of whatever colour the noise happened to be.
+  const tinted = config.colorMode === 'Tinted';
+  const paperAt = i => {
+    const r = pixels[i * 4], g = pixels[i * 4 + 1], b = pixels[i * 4 + 2], top = Math.max(r, g, b), sure = Math.min(1, top / 32);
+    return [r, g, b].map((c, k) => Math.round(bg[k] * .650001 + (255 - (255 - c * 255 / (top || 1)) * sure) * .35));
+  };
+  // `Toned` keeps one hue family, as a cyanotype or a selenium-toned print
+  // does: film grain's continuous tone runs foreground -> midtone ->
+  // background instead of one straight mix, so the shadows hold a deep tint
+  // that a two-ink mix would pass through as grey. On a screened style each
+  // dot takes the ramp at its own tone, so light grains run from dim to
+  // near-white with the light instead of being one grey.
+  const toned = config.colorMode === 'Toned', mid = toned ? rgb(config.midtone) : null;
+  const toneRamp = v => v < .499999 ? fg.map((a, k) => Math.round(a + (mid[k] - a) * v * 2)) : mid.map((a, k) => Math.round(a + (bg[k] - a) * (v * 2 - 1)));
+  const out = sctx.createImageData(qw, qh);
+  const filmGrain = config.ditherStyle === 'Film grain';
+  const grainAmount = clamp(Number(config.grainAmount) || 0);
+  // `screenLevels` above 2 turns the one-bit screen into a multi-level one: the
+  // tone is split into `steps - 1` bands, and inside each band the same gate
+  // picks between its two neighbouring inks, so the screen steps through evenly
+  // spaced mixes of ink and paper (4 levels on black: black, dark grey, light
+  // grey, near white) instead of jumping from one to the other. At 2 the branch
+  // below never runs, so every look published before it renders byte for byte.
+  const steps = Math.max(2, Math.min(8, Math.round(Number(config.screenLevels) || 2)));
+  const stepped = steps > 2 && !filmGrain;
+  for (let y = 0; y < qh; y++) for (let x = 0; x < qw; x++) {
+    const i = y * qw + x, ax = authoredX[x], ay = authoredY[y];
+    const cell = Math.min(rows - 1, Math.floor(ay * rows / ah)) * cols + Math.min(cols - 1, Math.floor(ax * cols / aw));
+    // The highlight branch is a light print screen; full 1-bit coverage makes
+    // this area darker than the type, reversing the Newsprint hierarchy.
+    // Pure dithering uses the complete tonal range; existing text looks keep
+    // their lighter paper screen and unchanged split-field hierarchy.
+    const baseTone = ditherOnly ? tones[i] : 1 - (1 - tones[i]) * .220001;
+    // Film's smooth contrast shoulder clears paper and deepens shadows.
+    const printTone = filmGrain ? baseTone ** 2 / (baseTone ** 2 + (1 - baseTone) ** 2) : baseTone;
+    const screened = !scaled && !textCells[cell];
+    // 0 is full ink, `steps - 1` bare paper. Two levels reduce to the one-bit
+    // test on the next line; the general form only runs when `stepped`.
+    let level = 0;
+    if (stepped && screened) {
+      const s = clamp(config.ditherStyle === '1-bit threshold' ? tones[i] : printTone) * (steps - 1), band = Math.min(steps - 2, Math.floor(s));
+      level = band + (s - band >= ditherGate(ax, ay, config.ditherStyle) ? 1 : 0);
+    }
+    const ink = stepped ? screened && level < steps - 1
+      : screened && (config.ditherStyle === '1-bit threshold' ? tones[i] < .5 : printTone < ditherGate(ax, ay, config.ditherStyle));
+    // Film mode keeps continuous tones with irregular silver-like grain.
+    // The bell-shaped envelope leaves black/white endpoints clean.
+    const v = filmGrain ? clamp(printTone + (grainAt(ax, ay) - .5) * grainAmount * 4 * printTone * (1 - printTone)) : printTone;
+    const paper = tinted ? paperAt(i) : bg;
+    const filmInk = filmGrain || ink ? inkAt(i) : paper;
+    let c = filmGrain && screened ? toned ? toneRamp(v) : paper.map((b, k) => Math.round(filmInk[k] * (1 - v) + b * v)) : ink ? shades ? toneRamp(shades[i]) : filmInk : paper;
+    // A stepped ink sits `f` of the way from the dot's own ink (the Toned ramp
+    // when that mode is on) to the paper. Background removal fades it by the
+    // same share, and the colour is solved so that the dot still reads as that
+    // mix where the paper shows through.
+    const f = stepped && ink ? level / (steps - 1) : 0, alphaStep = 1 - f * config.backgroundRemoval;
+    if (f) { const ik = c; c = paper.map((b, k) => Math.round((ik[k] * (1 - f) + b * f * (1 - config.backgroundRemoval)) / alphaStep)); }
+    if (marquee) {
+      // Sparse screen lights, driven by the actual source rather than a fixed overlay.
+      const cx = Math.floor(ax * cols / aw), cy = Math.floor(ay * rows / ah);
+      const lit = ink && cx % 6 === 0 && cy % 4 < 2;
+      c = lit ? bg.map((b, k) => Math.round(b + (c[k] - b) * tones[i] * .7)) : bg;
+    }
+    out.data[i * 4] = c[0]; out.data[i * 4 + 1] = c[1]; out.data[i * 4 + 2] = c[2];
+    out.data[i * 4 + 3] = filmGrain && screened
+      ? Math.round(255 * (1 - v * config.backgroundRemoval))
+      : ink ? (f ? Math.round(255 * alphaStep) : 255) : Math.round(255 * (1 - config.backgroundRemoval));
+  }
+  const flare = clamp(Number(config.starFlare) || 0);
+  if (flare > 0) {
+    // The share of ink each raster pixel asks for, the same number its gate
+    // is compared with.
+    const density = new Float32Array(qw * qh);
+    // Read against the ceiling, so a capped look still finds its stars.
+    for (let i = 0; i < density.length; i++) density[i] = Math.min(1, (ditherOnly ? 1 - tones[i] : (1 - tones[i]) * .219999) / ceiling);
+    drawStarFlares(out.data, density, qw, qh, flare, (x, y) => ditherGate(authoredX[Math.max(0, Math.min(qw - 1, x))], authoredY[Math.max(0, Math.min(qh - 1, y))], config.ditherStyle), inkAt);
+  }
+  sctx.putImageData(out, 0, 0);
+  ctx.save(); ctx.beginPath(); ctx.rect(ox, oy, dw, dh); ctx.clip();
+  ctx.imageSmoothingEnabled = false; ctx.drawImage(sampler, ox, oy, dw, dh);
+  const cw = dw / cols, ch = dh / rows;
+  ctx.font = `700 ${Math.min(ch * .98, cw / .62)}px monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.shadowBlur = config.glow * dw / 1920; ctx.shadowColor = config.foreground;
+  const text = [...config.text];
+  if (text.length && config.typeStyle === 'Scaled') drawScaledType(ctx, config, text, textCells, tones, inkAt, { cols, rows, qw, qh, ox, oy, cw, ch });
+  else if (text.length) for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    if (!textCells[y * cols + x] || (marquee && (x % 6 !== 0 || y % 4 > 1))) continue;
+    const sx = Math.min(qw - 1, Math.floor((x + .5) * qw / cols)), sy = Math.min(qh - 1, Math.floor((y + .5) * qh / rows)), i = sy * qw + sx;
+    ctx.globalAlpha = marquee ? .04 + tones[i] * .499999 : 1;
+    ctx.fillStyle = css(inkAt(i));
+    ctx.fillText(text[(y * cols + x) % text.length], ox + (x + .500001) * cw, oy + (y + .500001) * ch);
+  }
+  ctx.restore(); ctx.shadowBlur = 0;
+  // Preserve source transparency exactly, including around contained media.
+  ctx.imageSmoothingEnabled = true;
+  ctx.globalCompositeOperation = 'destination-in'; ctx.drawImage(source, crop.x, crop.y, crop.width, crop.height, ox, oy, dw, dh); ctx.globalCompositeOperation = 'source-over';
+  if (config.fixedFrame === true) {
+    // Extend only the contained margins; preserve source alpha and the subject.
+    ctx.fillStyle = config.background;
+    ctx.globalAlpha = 1 - config.backgroundRemoval;
+    ctx.fillRect(0, 0, w, oy);
+    ctx.fillRect(0, oy + dh, w, h - oy - dh);
+    ctx.fillRect(0, oy, ox, dh);
+    ctx.fillRect(ox + dw, oy, w - ox - dw, dh);
+    ctx.globalAlpha = 1;
+  }
+  return { width: w, height: h, bounds: { x: ox, y: oy, width: dw, height: dh } };
+}
+
+/** `preview`: a live preview (see renderDitherTextFrame); a code export leaves it off. */
+function attachDitherText(canvas, initial, { preview = false } = {}) {
+  const sampler = document.createElement('canvas');
+  let config = initial, source, pending, video, token = 0, alive = true, raf = 0, dirty = true, lastTime = -1, lastDraw = -Infinity;
+  const release = () => {
+    if (pending) pending.onload = pending.onloadeddata = pending.onerror = null;
+    if (video) { video.pause(); video.removeAttribute('src'); video.load(); }
+    pending = source = video = null;
+  };
+  function schedule(force = true) {
+    dirty ||= Boolean(force);
+    if (!alive || raf) return;
+    raf = requestAnimationFrame(now => {
+      raf = 0;
+      const time = video?.currentTime ?? 0;
+      if (dirty || (video?.readyState >= 2 && time !== lastTime && now - lastDraw >= 1000 / 30)) {
+        dirty = false; lastTime = time; lastDraw = now;
+        try { renderDitherTextFrame(canvas, source, config, { width: canvas.clientWidth, height: canvas.clientHeight, pixelRatio: Math.min(globalThis.devicePixelRatio || 1, 2), sampler, time, preview }); }
+        catch { canvas.dataset.mediaError = 'Source is not readable'; }
+      }
+      if (source && video) schedule(false);
+    });
+  }
+  function load(src) {
+    const mine = ++token; release(); lastTime = -1; delete canvas.dataset.mediaError;
+    const moving = /\.(mp4|webm|mov|m4v|ogv)(\?|#|$)|#hx=video|^data:video\//i.test(src);
+    const media = moving ? document.createElement('video') : new Image(); pending = media;
+    media.crossOrigin = 'anonymous';
+    const ready = () => { if (!alive || mine !== token) return; source = media; if (moving) media.play().catch(() => {}); schedule(); };
+    media.onerror = () => { if (mine === token) { release(); canvas.dataset.mediaError = 'Source could not be loaded'; schedule(); } };
+    if (moving) { video = media; media.muted = true; media.loop = true; media.playsInline = true; media.onloadeddata = ready; }
+    else media.onload = ready;
+    media.src = src; if (moving) media.load(); schedule();
+  }
+  const observer = new ResizeObserver(() => schedule()); observer.observe(canvas); load(config.source);
+  return { getCurrentTime: () => video?.currentTime ?? 0,
+    update(next) { const changed = next.source !== config.source; config = next; if (changed) load(next.source); else schedule(); },
+    destroy() { alive = false; token++; cancelAnimationFrame(raf); observer.disconnect(); release(); sampler.width = sampler.height = 0; }
+  };
+}
+
+const config = {
+  "viewportWidth": 1920,
+  "viewportHeight": 1080,
+  "text": "",
+  "typeStyle": "Print",
+  "cellSize": 15,
+  "ditherPixelSize": 5,
+  "threshold": 0.45,
+  "gamma": 0.72,
+  "ditherStyle": "Bayer 8x8",
+  "colorMode": "Mono",
+  "foreground": "#ffffff",
+  "background": "#000000",
+  "splitMode": "Dither only",
+  "invert": "on",
+  "glow": 0,
+  "backgroundRemoval": 1,
+  "softness": 0,
+  "grainAmount": 0.549999,
+  "screenInset": 0,
+  "screenLevels": 2,
+  "blackHold": 0,
+  "highlightCeiling": 1,
+  "shadowFloor": 0,
+  "levelFrom": "Whole frame",
+  "autoLevel": 0.769999,
+  "starFlare": 1,
+  "midtone": "#516a88",
+  "highKeyLevel": "auto",
+  "highKeyGamma": "auto",
+  "highKeyFrom": "Light frame",
+  "cutoutGround": 0,
+  "source": "./source.png",
+  "fixedFrame": true,
+  "sourceFit": "cover"
+};
+const scene = attachDitherText(document.querySelector('.dither-text-canvas'), config);
+const dispose = () => { scene.destroy(); window.removeEventListener('pagehide', dispose); };
+window.addEventListener('pagehide', dispose, { once: true });
+</script>
+</body>
+</html>

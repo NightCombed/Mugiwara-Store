@@ -1960,3 +1960,29 @@ img {
 
 /* Hide obsolete elements */
 .pulse-dot { display: none; }
+
+/* ===== Hero Background Art (large bg layer) ===== */
+.hero-logo-display {
+  position: relative;
+  overflow: hidden;
+}
+
+.hero-bg-art {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center center;
+  opacity: 0.18;
+  mix-blend-mode: screen;
+  pointer-events: none;
+  z-index: 0;
+  filter: contrast(1.2) brightness(1.05);
+  user-select: none;
+}
+
+.hero-logo-big {
+  position: relative;
+  z-index: 1;
+}
