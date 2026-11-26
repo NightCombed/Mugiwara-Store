@@ -19,7 +19,7 @@
   --border-muted: #2f3336;
   --border-strong: #3e4247;
   --border-white: #ffffff;
-  --border-glow: rgba(255, 255, 255, 0.25);
+  --border-glow: transparent;
   
   /* Text & Typography Colors */
   --text-pure-white: #ffffff;
@@ -276,7 +276,7 @@ img {
 .btn-primary:hover {
   background-color: var(--btn-primary-hover);
   transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(255, 255, 255, 0.15);
+  box-shadow: none;
 }
 
 .btn-outline {
@@ -384,7 +384,7 @@ img {
   height: 6px;
   background-color: var(--text-pure-white);
   border-radius: 50%;
-  box-shadow: 0 0 8px rgba(255, 255, 255, 0.8);
+  box-shadow: none;
 }
 
 .hero-title {
@@ -475,7 +475,7 @@ img {
 .hero-card:hover {
   border-color: var(--border-white);
   transform: translateY(-3px);
-  box-shadow: 0 25px 50px -15px rgba(255, 255, 255, 0.06), 0 0 1px 1px var(--border-white);
+  box-shadow: 0 0 1px 1px var(--border-white);
 }
 
 .hero-card-cover-wrap {
@@ -721,7 +721,7 @@ img {
 #filter-luxo:checked ~ .filter-tabs label[for="filter-luxo"] {
   background-color: var(--text-pure-white);
   color: var(--bg-black);
-  box-shadow: 0 2px 8px rgba(255, 255, 255, 0.2);
+  box-shadow: none;
 }
 
 /* ==========================================================================
@@ -1007,7 +1007,7 @@ img {
 .btn-adquirir:hover {
   background-color: var(--btn-primary-hover);
   transform: translateY(-1px);
-  box-shadow: 0 4px 12px rgba(255, 255, 255, 0.2);
+  box-shadow: none;
 }
 
 .btn-detalhes {
@@ -1352,7 +1352,7 @@ img {
 
 .form-input:focus, .form-textarea:focus, .form-select:focus {
   border-color: var(--border-white);
-  box-shadow: 0 0 0 1px var(--border-white);
+  box-shadow: none;
   background-color: var(--bg-surface-elevated);
 }
 
@@ -1702,7 +1702,6 @@ img {
   height: auto;
   object-fit: contain;
   mix-blend-mode: lighten;
-  filter: drop-shadow(0 0 60px rgba(255, 255, 255, 0.08));
   animation: float 6s ease-in-out infinite;
 }
 
@@ -1849,7 +1848,6 @@ img {
   height: auto;
   object-fit: contain;
   mix-blend-mode: lighten;
-  filter: drop-shadow(0 0 50px rgba(255, 255, 255, 0.12));
   animation: float 6s ease-in-out infinite;
 }
 
@@ -1886,7 +1884,6 @@ img {
   object-fit: contain;
   mix-blend-mode: lighten;
   flex-shrink: 0;
-  filter: drop-shadow(0 0 20px rgba(255, 255, 255, 0.15));
 }
 
 .social-links-grid {
